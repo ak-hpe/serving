@@ -80,8 +80,8 @@ var (
 
 // Declare controller constants
 const (
-	controllerServiceAccountName      = "controller"
-	controllerNamespace = "knative-serving"
+	controllerSA = "controller"
+	controllerNS = "knative-serving"
 )
 
 func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (bool, error) {
@@ -94,47 +94,51 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		return true, nil
 	}
 
-	//Extract imagepullsecret from Revision of fallback to controller SA
-	var imagePullSecrets []string
-	if len(rev.Spec.ImagePullSecrets) > 0 {
-		for _, s := range rev.Spec.ImagePullSecrets {
-			imagePullSecrets = append(imagePullSecrets, s.Name)
-		}
-	} else {
-		// If no image pull secrets are specified, we use the controller service account's image pull secrets.
-		sa, err := c.kubeclient.CoreV1().ServiceAccounts(controllerNamespace).Get(ctx, controllerServiceAccountName, metav1.GetOptions{})
-		if err != nil {
-			return false, err
-		}
-		for _, s := range sa.ImagePullSecrets {
-			imagePullSecrets = append(imagePullSecrets, s.Name)
-		}
-	}
-	
 	cfgs := config.FromContext(ctx)
-	// opt := k8schain.Options{
-	// 	Namespace:          rev.Namespace,
-	// 	ServiceAccountName: rev.Spec.ServiceAccountName,
-	// 	ImagePullSecrets:   imagePullSecrets,
-	// }
+	logger := logging.FromContext(ctx)
+
+	// --- Attempt #1: Use Revision SA and secrets
+	imagePullSecrets := make([]string, 0, len(rev.Spec.ImagePullSecrets))
+	for _, s := range rev.Spec.ImagePullSecrets {
+		imagePullSecrets = append(imagePullSecrets, s.Name)
+	}
 	opt := k8schain.Options{
-		Namespace:          controllerNamespace,
-		ServiceAccountName: controllerServiceAccountName,
+		Namespace:          rev.Namespace,
+		ServiceAccountName: rev.Spec.ServiceAccountName,
 		ImagePullSecrets:   imagePullSecrets,
 	}
 
-	logger := logging.FromContext(ctx)
-	
-	logger.Info("using image pull secret---->", imagePullSecrets)
-	logger.Info("opt value---->", opt)
-
 	initContainerStatuses, statuses, err := c.resolver.Resolve(logger, rev, opt, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
-	if err != nil {
-		// Clear the resolver so we can retry the digest resolution rather than
-		// being stuck with this error.
-		c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})
-		rev.Status.MarkContainerHealthyFalse(v1.ReasonContainerMissing, err.Error())
-		return true, err
+
+	// --- If auth fails, attempt fallback to controller SA
+	if err != nil && strings.Contains(err.Error(), "401") {
+		logger.Warnf("Primary digest resolution failed with 401, trying fallback to controller SA")
+		c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})		
+		// Get controller SA imagePullSecrets (optional: cache this)
+		controllerSAObj, err2 := c.kubeclient.CoreV1().ServiceAccounts(controllerNS).Get(ctx, controllerSA, metav1.GetOptions{})
+		if err2 != nil {
+			logger.Errorf("fallback failed getting controller SA: %v", err2)
+			return true, err2
+		}
+
+		controllerSecrets := make([]string, 0, len(controllerSAObj.ImagePullSecrets))
+		for _, s := range controllerSAObj.ImagePullSecrets {
+			controllerSecrets = append(controllerSecrets, s.Name)
+		}
+
+		// Retry digest resolution using controller SA credentials
+		optFallback := k8schain.Options{
+			Namespace:          controllerNS,
+			ServiceAccountName: controllerSA,
+			ImagePullSecrets:   controllerSecrets,
+		}
+
+		initContainerStatuses, statuses, err = c.resolver.Resolve(logger, rev, optFallback, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
+		if err != nil {
+			c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})
+			rev.Status.MarkContainerHealthyFalse(v1.ReasonContainerMissing, err.Error())
+			return true, err
+		}
 	}
 
 	if len(statuses) > 0 || len(initContainerStatuses) > 0 {
