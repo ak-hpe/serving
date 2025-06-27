@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
@@ -77,6 +78,12 @@ var (
 	_ pkgreconciler.OnDeletionInterface = (*Reconciler)(nil)
 )
 
+// Declare controller constants
+const (
+	controllerServiceAccountName      = "controller"
+	controllerNamespace = "knative-serving"
+)
+
 func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (bool, error) {
 	totalNumOfContainers := len(rev.Spec.Containers) + len(rev.Spec.InitContainers)
 
@@ -87,10 +94,23 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 		return true, nil
 	}
 
-	imagePullSecrets := make([]string, 0, len(rev.Spec.ImagePullSecrets))
-	for _, s := range rev.Spec.ImagePullSecrets {
-		imagePullSecrets = append(imagePullSecrets, s.Name)
+	//Extract imagepullsecret from Revision of fallback to controller SA
+	var imagePullSecrets []string
+	if len(rev.Spec.ImagePullSecrets) > 0 {
+		for _, s := range rev.Spec.ImagePullSecrets {
+			imagePullSecrets = append(imagePullSecrets, s.Name)
+		}
+	} else {
+		// If no image pull secrets are specified, we use the controller service account's image pull secrets.
+		sa, err := c.kubeclient.CoreV1().ServiceAccounts(controllerNamespace).Get(ctx, controllerServiceAccountName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		for _, s := range sa.ImagePullSecrets {
+			imagePullSecrets = append(imagePullSecrets, s.Name)
+		}
 	}
+	// If no image pull secrets are specified, we use the controller service account's image pull secrets.
 	cfgs := config.FromContext(ctx)
 	opt := k8schain.Options{
 		Namespace:          rev.Namespace,
@@ -99,6 +119,9 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 	}
 
 	logger := logging.FromContext(ctx)
+	
+	logger.Info("using image pull secret---->", imagePullSecrets)
+
 	initContainerStatuses, statuses, err := c.resolver.Resolve(logger, rev, opt, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
 	if err != nil {
 		// Clear the resolver so we can retry the digest resolution rather than
