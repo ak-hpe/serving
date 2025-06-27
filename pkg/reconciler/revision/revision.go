@@ -110,17 +110,23 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 			imagePullSecrets = append(imagePullSecrets, s.Name)
 		}
 	}
-	// If no image pull secrets are specified, we use the controller service account's image pull secrets.
+	
 	cfgs := config.FromContext(ctx)
+	// opt := k8schain.Options{
+	// 	Namespace:          rev.Namespace,
+	// 	ServiceAccountName: rev.Spec.ServiceAccountName,
+	// 	ImagePullSecrets:   imagePullSecrets,
+	// }
 	opt := k8schain.Options{
-		Namespace:          rev.Namespace,
-		ServiceAccountName: rev.Spec.ServiceAccountName,
+		Namespace:          controllerNamespace,
+		ServiceAccountName: controllerServiceAccountName,
 		ImagePullSecrets:   imagePullSecrets,
 	}
 
 	logger := logging.FromContext(ctx)
 	
 	logger.Info("using image pull secret---->", imagePullSecrets)
+	logger.Info("opt value---->", opt)
 
 	initContainerStatuses, statuses, err := c.resolver.Resolve(logger, rev, opt, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
 	if err != nil {
