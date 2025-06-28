@@ -33,6 +33,7 @@ import (
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	cachingclientset "knative.dev/caching/pkg/client/clientset/versioned"
 	networkingclientset "knative.dev/networking/pkg/client/clientset/versioned"
+	"knative.dev/pkg/system"
 	"knative.dev/pkg/tracker"
 	clientset "knative.dev/serving/pkg/client/clientset/versioned"
 
@@ -78,12 +79,6 @@ var (
 	_ pkgreconciler.OnDeletionInterface = (*Reconciler)(nil)
 )
 
-// Declare controller constants
-const (
-	controllerSA = "controller"
-	controllerNS = "knative-serving"
-)
-
 func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (bool, error) {
 	totalNumOfContainers := len(rev.Spec.Containers) + len(rev.Spec.InitContainers)
 
@@ -97,48 +92,50 @@ func (c *Reconciler) reconcileDigest(ctx context.Context, rev *v1.Revision) (boo
 	cfgs := config.FromContext(ctx)
 	logger := logging.FromContext(ctx)
 
-	// --- Attempt #1: Use Revision SA and secrets
-	imagePullSecrets := make([]string, 0, len(rev.Spec.ImagePullSecrets))
-	for _, s := range rev.Spec.ImagePullSecrets {
-		imagePullSecrets = append(imagePullSecrets, s.Name)
+	// Determine resolution policy from annotation
+	useRevisionSA := rev.Annotations["resolution.knative.dev/use-revision-sa"] == "true"
+	var namespace, serviceAccount string
+	var imagePullSecrets []string
+
+	if useRevisionSA {
+		// Use SA and secrets from the revision
+		namespace = rev.Namespace
+		serviceAccount = rev.Spec.ServiceAccountName
+		for _, s := range rev.Spec.ImagePullSecrets {
+			imagePullSecrets = append(imagePullSecrets, s.Name)
+		}
+	} else {
+		// Use controller SA and secrets from knative-serving
+		controllerNS := system.Namespace()
+		controllerSA := "controller"
+		controllerSAObj, err := c.kubeclient.CoreV1().ServiceAccounts(controllerNS).Get(ctx, controllerSA, metav1.GetOptions{})
+		if err != nil {
+			return true, err
+		}
+
+		for _, s := range controllerSAObj.ImagePullSecrets {
+			imagePullSecrets = append(imagePullSecrets, s.Name)
+		}
+		namespace = controllerNS
+		serviceAccount = controllerSA
 	}
 	opt := k8schain.Options{
-		Namespace:          rev.Namespace,
-		ServiceAccountName: rev.Spec.ServiceAccountName,
+		Namespace:          namespace,
+		ServiceAccountName: serviceAccount,
 		ImagePullSecrets:   imagePullSecrets,
 	}
 
-	initContainerStatuses, statuses, err := c.resolver.Resolve(logger, rev, opt, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
-
-	// --- If auth fails, attempt fallback to controller SA
-	if err != nil && strings.Contains(err.Error(), "401") {
-		logger.Warnf("Primary digest resolution failed with 401, trying fallback to controller SA")
-		c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})		
-		// Get controller SA imagePullSecrets (optional: cache this)
-		controllerSAObj, err2 := c.kubeclient.CoreV1().ServiceAccounts(controllerNS).Get(ctx, controllerSA, metav1.GetOptions{})
-		if err2 != nil {
-			logger.Errorf("fallback failed getting controller SA: %v", err2)
-			return true, err2
-		}
-
-		controllerSecrets := make([]string, 0, len(controllerSAObj.ImagePullSecrets))
-		for _, s := range controllerSAObj.ImagePullSecrets {
-			controllerSecrets = append(controllerSecrets, s.Name)
-		}
-
-		// Retry digest resolution using controller SA credentials
-		optFallback := k8schain.Options{
-			Namespace:          controllerNS,
-			ServiceAccountName: controllerSA,
-			ImagePullSecrets:   controllerSecrets,
-		}
-
-		initContainerStatuses, statuses, err = c.resolver.Resolve(logger, rev, optFallback, cfgs.Deployment.RegistriesSkippingTagResolving, cfgs.Deployment.DigestResolutionTimeout)
-		if err != nil {
-			c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})
-			rev.Status.MarkContainerHealthyFalse(v1.ReasonContainerMissing, err.Error())
-			return true, err
-		}
+	initContainerStatuses, statuses, err := c.resolver.Resolve(
+		logger,
+		rev,
+		opt,
+		cfgs.Deployment.RegistriesSkippingTagResolving,
+		cfgs.Deployment.DigestResolutionTimeout,
+	)
+	if err != nil {
+		c.resolver.Clear(types.NamespacedName{Namespace: rev.Namespace, Name: rev.Name})
+		rev.Status.MarkContainerHealthyFalse(v1.ReasonContainerMissing, err.Error())
+		return true, err
 	}
 
 	if len(statuses) > 0 || len(initContainerStatuses) > 0 {
